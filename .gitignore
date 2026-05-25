@@ -1,0 +1,30 @@
+# SECRETS — never commit
+ok.txt
+adres.txt
+*.key
+*.pk
+
+# Session / state / discovery
+session.json
+endpoints.json
+ofc_profile/
+ofc_state.json
+ofc.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.python-version
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Editor
+.vscode/
+.idea/

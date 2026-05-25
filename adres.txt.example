@@ -1,0 +1,13 @@
+# OFC FanPass — Wallet Tujuan (Clean)
+#
+# Isi 1 address saja di baris pertama. Address ini akan menerima:
+#  - Semua OFC yang ter-claim
+#  - Semua sisa ETH Base
+#
+# Address tujuan HARUS:
+#  - Wallet BARU yang dibuat di device BERSIH (bukan device yang pernah compromised)
+#  - Seed phrase ditulis di KERTAS, tidak pernah diketik di komputer
+#  - Idealnya: hardware wallet (Ledger / Trezor)
+#
+# Rename file ini ke `adres.txt` dan isi dengan address tujuan kamu.
+0xYourCleanNewWalletAddressHere

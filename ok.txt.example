@@ -1,0 +1,11 @@
+# OFC FanPass — Private Keys
+#
+# Format: 1 private key per baris (hex 64 char, dengan/tanpa 0x prefix)
+# Comment: # di awal baris atau setelah PK
+#
+# Rename file ini ke `ok.txt` lalu isi dengan PK kamu.
+# File `ok.txt` sudah di-gitignore — TIDAK akan ke-push ke GitHub.
+#
+# Contoh format (JANGAN PAKAI PK DUMMY INI):
+# 0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318    # wallet1
+# 0xfa372b56eac0e71de587267f0eb5c63fb35fb0cdf76f08006eb7be94c7c5b41a    # wallet2
