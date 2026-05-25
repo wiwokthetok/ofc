@@ -2,11 +2,21 @@
 
 Auto-claim airdrop OneFootball FanPass (OFC) lalu **langsung sweep** ke wallet bersih, supaya sweeper bot drainer tidak sempat ambil.
 
-## Arsitektur v2 — Pure HTTP
+## Arsitektur v3 — Pure HTTP + Race-mode Bundle
+
+### Speed optimizations
+
+- **Multi-RPC parallel broadcast** — claim tx dikirim ke 7 Base RPC simultan (drpc, publicnode, official, meowrpc, dll). Yang pertama confirm jadi tx_hash kita. Total round-trip ~360ms.
+- **Pre-sign sebelum y/n prompt** — sign tx duluan, broadcast = upload raw bytes saja.
+- **Gas aggressive**: 3× network rate untuk claim, **4× untuk sweep**. Sweeper bot drainer biasanya 1.5× — kalah priority.
+- **Receipt polling 0.5s** (vs default 1s)
+- **Gas oracle multi-fallback** — pakai RPC tercepat (drpc.org ~91ms)
+
+### Architecture
 
 - **Playwright HANYA untuk login Google** (one-time per session). Setelah session.json terbentuk, browser tidak dipakai lagi.
 - **Claim murni via HTTP requests + web3.py** — cepat (<1 detik per request) tanpa overhead browser.
-- **Auto-discovery API** — script otomatis cari endpoint OneFootball yang aktif.
+- **Auto-discovery API** via Playwright recon-wallet (one-time per endpoint set). Script meng-inject custom `window.ethereum` yang menangkap params `eth_sendTransaction` tanpa broadcast — sehingga kita belajar contract address + calldata dari klik Claim asli user.
 - **Login detection akurat** — verifikasi via API call (`/users-accounts-api/v1/settings/profile`), bukan heuristic cookie.
 
 ## Setup
@@ -121,12 +131,42 @@ python p.py
 - **Race-mode sweep:** gas claim 1.5× network, gas sweep 2.0× network. Sweeper bot drainer biasanya pakai 1.5× — kalah priority.
 - **Sweep ordering:** broadcast 2 tx (OFC transfer dengan nonce N, ETH sweep dengan nonce N+1). Keduanya masuk block yang sama atau berurutan.
 
+## Race-mode mechanics
+
+### Kenapa cepat?
+
+1. **Pre-sign** — saat user lihat dialog y/n, claim tx sudah ke-sign jadi raw bytes. Tinggal upload, no compute time.
+2. **Multi-RPC parallel** — broadcast ke 7 RPC sekaligus, bukan satu-satu retry. Total time = waktu RPC tercepat (~90ms).
+3. **High gas** — Base sequencer FIFO + priority fee. Gas 3-4× current rate jamin masuk block berikutnya.
+4. **No browser overhead** — claim = 1 HTTP request + 1 raw broadcast, total <200ms untuk init phase.
+
+### Race-mode estimasi waktu (per wallet)
+
+| Step | Time |
+|---|---|
+| Fetch allocation API | ~150ms |
+| Build + sign claim tx | ~5ms |
+| Broadcast claim (multi-RPC parallel) | ~360ms |
+| Wait Base block confirm | ~2s (Base block time) |
+| Sweep broadcast (multi-RPC parallel) | ~360ms |
+| **Total per wallet** | **~3 detik** |
+
+Dibanding browser-based claim (3-10 detik per page load + manual klik), ini **2-3× lebih cepat**.
+
+### Vs Rust/Cargo
+
+User tanya soal Rust untuk speed: signing crypto sudah pakai libsecp256k1 (C lib, same yang dipakai Foundry/Geth) — sudah max speed di level algoritma. Bottleneck = network latency RPC, bukan signing. Rust tidak akan mempercepat lebih lanjut. Yang bisa dipercepat = paralelisme (sudah dilakukan) + private mempool (planned: Flashbots Protect).
+
 ## Roadmap
 
-- [ ] Auto-recon via Playwright kalau API endpoint belum ke-discover (intercept request saat user manual klik Claim sekali)
-- [ ] Pre-sign sweep txs sebelum claim broadcast, untuk bundle Flashbots
-- [ ] Multi-RPC failover (kalau public RPC down)
+- [x] Auto-recon via Playwright (intercept user's manual Claim click)
+- [x] Multi-RPC parallel broadcast (7 Base RPCs)
+- [x] Pre-sign claim sebelum y/n prompt
+- [ ] Pre-sign sweep dgn nonce N+1 untuk bundle dalam 1 block
+- [ ] Flashbots Protect / private mempool integration
+- [ ] WebSocket subscribe untuk instant block notification
 - [ ] Telegram notification setelah claim sukses
+- [ ] Multi-wallet parallel claim (kalau >5 wallet)
 
 ## Lisensi
 
