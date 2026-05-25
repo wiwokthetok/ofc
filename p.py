@@ -66,7 +66,21 @@ LOG_FILE     = HERE / "ofc.log"
 
 CLAIM_URL    = "https://fanpass.onefootball.com/airdrop-claim"
 OF_API       = "https://api.onefootball.com"
-PROFILE_API  = f"{OF_API}/users-accounts-api/v1/settings/profile"
+USERS_API    = f"{OF_API}/users-accounts-api/"           # auth, settings, profile
+FANPASS_API  = f"{OF_API}/fanpass-service/"               # fanpass general
+METAGAME_API = f"{OF_API}/fanpass-metagame-backend/"      # CLAIM / vesting / merkle-rewards
+PROFILE_API  = f"{USERS_API}v1/settings"                  # GET 200 = logged in
+
+# REAL endpoint paths (relative to METAGAME_API) — discovered from production JS bundle
+EP_STATUS      = lambda addr: f"reward/status/{addr}"
+EP_FIRSTCLAIM  = lambda addr: f"reward/first-claim/{addr}"
+EP_VESTING     = lambda addr: f"reward/vesting/{addr}"
+EP_SIGNATURE   = lambda addr: f"merkle-rewards/signature/{addr}"  # returns {index, amount, proof}
+EP_CLAIMSTATUS = "merkle-rewards/claim-status"
+
+# REAL contract addresses (verified on Base)
+CLAIM_CONTRACT = "0x06821F0A313871eBDCD5B2D4A56f2b7dB8853B00"  # Airdrop contract (has claim() function)
+OFC_TOKEN      = "0x752C5a95d202972E124390F30a50154409d3c858"  # OFC ERC-20 (18 decimals)
 
 # Multi-RPC for parallel broadcast (race-mode: first confirms wins)
 BASE_RPCS = [
@@ -93,6 +107,31 @@ ERC20_ABI = [
     {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
     {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
 ]
+
+def load_claim_abi() -> list:
+    """Load full claim contract ABI from cp_abi.json (extracted from OneFootball production JS)."""
+    abi_path = HERE / "cp_abi.json"
+    if abi_path.exists():
+        try: return json.loads(abi_path.read_text())
+        except: pass
+    # Minimal fallback if file missing
+    return [
+        {"inputs":[{"internalType":"uint256","name":"index","type":"uint256"},
+                   {"internalType":"uint256","name":"amount","type":"uint256"},
+                   {"internalType":"uint8","name":"vestingMonths","type":"uint8"},
+                   {"internalType":"bytes32[]","name":"proof","type":"bytes32[]"}],
+         "name":"claim","outputs":[],"stateMutability":"payable","type":"function"},
+        {"inputs":[],"name":"getClaimFeeInEth","outputs":[{"internalType":"uint256","type":"uint256"}],"stateMutability":"view","type":"function"},
+        {"inputs":[],"name":"TOKEN","outputs":[{"internalType":"address","type":"address"}],"stateMutability":"view","type":"function"},
+        {"inputs":[],"name":"paused","outputs":[{"internalType":"bool","type":"bool"}],"stateMutability":"view","type":"function"},
+        {"inputs":[{"internalType":"uint256","name":"index","type":"uint256"},
+                   {"internalType":"address","name":"account","type":"address"},
+                   {"internalType":"uint256","name":"amount","type":"uint256"},
+                   {"internalType":"bytes32[]","name":"proof","type":"bytes32[]"}],
+         "name":"checkEligibility","outputs":[{"type":"bool"},{"type":"uint256[3]"}],"stateMutability":"view","type":"function"},
+    ]
+
+CLAIM_ABI = load_claim_abi()
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
@@ -227,45 +266,84 @@ def ensure_chromium():
         console.print("[dim]Installing chromium browser...[/dim]")
         subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
 
+def _have(cmd: str) -> bool:
+    return subprocess.run(["which", cmd], capture_output=True).returncode == 0
+
+def _apt_install(pkgs: list[str]) -> bool:
+    """Install via apt-get with proper error handling."""
+    sudo_prefix = ["sudo", "-n"] if os.geteuid() != 0 and _have("sudo") else []
+    cmds = [
+        sudo_prefix + ["apt-get", "update", "-qq"],
+        sudo_prefix + ["apt-get", "install", "-y", "-q", "--no-install-recommends"] + pkgs,
+    ]
+    for cmd in cmds:
+        if not cmd: continue
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            log(f"  [red]apt error:[/red] {' '.join(cmd)} → {r.stderr[-200:]}")
+            return False
+    return True
+
 def setup_novnc_if_needed() -> bool:
-    """Setup Xvfb + noVNC if no DISPLAY available. Returns True if running headed via noVNC."""
+    """Setup Xvfb + noVNC if no DISPLAY available. Returns True if headed display ready.
+
+    Untuk Termux Android user: gunakan SSH tunnel ke VPS:
+      ssh -L 6080:localhost:6080 root@VPS_IP
+    Lalu di browser HP: http://localhost:6080/vnc.html
+    """
     if os.environ.get("DISPLAY"):
         return True
-    if subprocess.run(["which", "Xvfb"], capture_output=True).returncode != 0:
-        console.print("[yellow]Setup noVNC (untuk login di VPS tanpa GUI)...[/yellow]")
-        subprocess.run(["apt-get", "update"], capture_output=True)
-        subprocess.run(["apt-get", "install", "-y", "xvfb", "x11vnc", "websockify", "novnc"], capture_output=True)
-    if subprocess.run(["which", "Xvfb"], capture_output=True).returncode != 0:
-        log("[red]Xvfb gagal install. Login harus di laptop, lalu copy session.json ke VPS.[/red]")
+
+    missing = [b for b in ("Xvfb", "x11vnc", "websockify") if not _have(b)]
+    novnc_dir = Path("/usr/share/novnc")
+    if not novnc_dir.exists():
+        missing.append("novnc")
+
+    if missing:
+        log(f"[yellow]Install dependencies: {missing}[/yellow]")
+        pkg_map = {"Xvfb": "xvfb", "x11vnc": "x11vnc", "websockify": "websockify", "novnc": "novnc"}
+        pkgs = list({pkg_map[m] for m in missing})
+        if not _apt_install(pkgs):
+            log("[red]Install gagal. Coba manual:[/red]")
+            log(f"  [cyan]sudo apt-get update && sudo apt-get install -y {' '.join(pkgs)}[/cyan]")
+            log("[yellow]Alternatif: login di laptop, lalu copy session.json + ofc_profile/ ke VPS via scp.[/yellow]")
+            return False
+
+    if not _have("Xvfb") or not _have("x11vnc"):
+        log("[red]Xvfb/x11vnc masih tidak ada setelah install. Cek manual.[/red]")
         return False
-    # start Xvfb
-    subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x800x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Start Xvfb
+    subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x800x24"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
     os.environ["DISPLAY"] = ":99"
-    # start x11vnc
+
+    # Start x11vnc with password
     vnc_pw = "ofc" + str(int(time.time()))[-5:]
     pw_file = Path.home() / ".ofcvncpw"
     subprocess.run(["x11vnc", "-storepasswd", vnc_pw, str(pw_file)], capture_output=True)
+    # listen on localhost only (user accesses via SSH tunnel) — lebih aman
     subprocess.Popen(["x11vnc", "-display", ":99", "-rfbauth", str(pw_file),
-                      "-listen", "0.0.0.0", "-rfbport", "5900", "-forever", "-shared"],
+                      "-listen", "127.0.0.1", "-rfbport", "5900", "-forever", "-shared", "-noxdamage"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
-    # start websockify + novnc
-    novnc_path = "/usr/share/novnc"
-    subprocess.Popen(["websockify", "--web", novnc_path, "6080", "localhost:5900"],
+
+    # Start websockify (also localhost only)
+    novnc_path = "/usr/share/novnc" if Path("/usr/share/novnc").exists() else "/usr/share/novnc-1.3.0"
+    subprocess.Popen(["websockify", "--web", novnc_path, "--listen", "127.0.0.1:6080", "127.0.0.1:5900"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
-    # detect public IP
-    try:
-        ip = requests.get("https://api.ipify.org", timeout=5).text
-    except Exception:
-        ip = "<VPS_IP>"
+
     console.print(Panel.fit(
-        f"[bold cyan]Buka URL ini di browser HP/laptop kamu:[/bold cyan]\n"
-        f"  http://{ip}:6080/vnc.html?host={ip}&port=6080&autoconnect=true\n"
-        f"  Password VNC: [bold]{vnc_pw}[/bold]\n\n"
-        f"[yellow]Pastikan port 6080 open di firewall VPS (ufw allow 6080/tcp).[/yellow]",
-        title="noVNC ACCESS", border_style="cyan"
+        f"[bold cyan]Akses noVNC via SSH tunnel (lebih aman, no firewall change):[/bold cyan]\n\n"
+        f"  [yellow]Di Termux Android (NEW SSH session, jangan tutup yg sekarang):[/yellow]\n"
+        f"    [bold]ssh -L 6080:localhost:6080 root@VPS_IP[/bold]\n\n"
+        f"  [yellow]Lalu di browser HP buka:[/yellow]\n"
+        f"    [bold]http://localhost:6080/vnc.html?host=localhost&port=6080&autoconnect=true&password={vnc_pw}[/bold]\n\n"
+        f"  [dim]Password VNC: {vnc_pw}[/dim]\n\n"
+        f"[green]Script lanjut otomatis setelah kamu login Google di browser VPS.[/green]",
+        title="noVNC SETUP — SSH TUNNEL MODE", border_style="cyan"
     ))
     return True
 
@@ -348,108 +426,100 @@ def ensure_logged_in() -> dict:
         log("[dim]Tidak ada sesi tersimpan. Login dibutuhkan.[/dim]")
     return asyncio.run(playwright_login_flow())
 
-# ---------- OneFootball API client ----------
+# ---------- OneFootball API client (REAL endpoints from prod JS) ----------
 class OFClient:
-    """Pure HTTP client. No browser."""
+    """Pure HTTP client. No browser. Real endpoints discovered from production JS bundle."""
     def __init__(self, session_data: dict):
         self.session = build_requests_session(session_data)
-        self.endpoints = load_endpoints()
+        self.bearer_token = self._extract_bearer(session_data)
+
+    def _extract_bearer(self, session_data: dict) -> str | None:
+        """OneFootball uses Bearer token from cookies or localStorage."""
+        for c in session_data.get("cookies", []):
+            n = c.get("name", "").lower()
+            if "access_token" in n or "bearer" in n or "jwt" in n:
+                return c["value"]
+        ls = session_data.get("local_storage", {}) or {}
+        for k, v in ls.items():
+            if "access_token" in k.lower() or "bearer" in k.lower():
+                if isinstance(v, str) and len(v) > 20:
+                    # might be JSON
+                    try:
+                        d = json.loads(v)
+                        return d.get("access_token") or d.get("token") or d.get("accessToken")
+                    except Exception:
+                        return v
+        return None
+
+    def _get(self, base: str, path: str, auth: bool = True, **kwargs) -> requests.Response:
+        url = f"{base}{path}"
+        headers = kwargs.pop("headers", {})
+        if auth and self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        return self.session.get(url, headers=headers, timeout=10, **kwargs)
 
     def profile(self) -> dict | None:
+        """GET /users-accounts-api/v1/settings — 200 = logged in."""
         try:
-            r = self.session.get(PROFILE_API, timeout=10)
+            r = self._get(USERS_API, "v1/settings", auth=True)
             if r.status_code == 200:
                 return r.json()
+            log(f"  profile status={r.status_code}: {r.text[:200]}")
         except Exception as e:
-            log(f"profile() err: {e}")
+            log(f"  profile err: {e}")
         return None
 
-    def fanpass_token(self) -> dict | None:
-        """Returns claim allocation + contract address + proof, if eligible."""
-        url = self.endpoints.get("token") or f"{OF_API}/fanpass-service/v1/token"
+    def reward_status(self, address: str) -> dict | None:
+        """GET fanpass-metagame-backend/reward/status/{address} — returns {code, message}. code==2 = eligible."""
         try:
-            r = self.session.get(url, timeout=10)
+            r = self._get(METAGAME_API, EP_STATUS(address), auth=False)
             if r.status_code == 200:
-                data = r.json()
-                self.endpoints["token"] = url
-                save_endpoints(self.endpoints)
-                return data
-            log(f"  fanpass-token status={r.status_code}: {r.text[:200]}")
+                return r.json()
+            log(f"  reward/status status={r.status_code}: {r.text[:300]}")
         except Exception as e:
-            log(f"  fanpass-token err: {e}")
+            log(f"  reward/status err: {e}")
         return None
 
-    def link_wallet_nonce(self, address: str) -> dict | None:
-        """Get message to sign for linking wallet."""
-        candidates = self.endpoints.get("link_nonce", []) or [
-            f"{OF_API}/fanpass-service/v1/wallet/link-message",
-            f"{OF_API}/fanpass-service/v1/wallet/nonce",
-            f"{OF_API}/users-accounts-api/v1/wallets/nonce",
-            f"{OF_API}/fanpass-service/v1/airdrop/link-message",
-        ]
-        if isinstance(candidates, str):
-            candidates = [candidates]
-        for url in candidates:
-            try:
-                # try GET with query, then POST with body
-                r = self.session.get(url, params={"address": address}, timeout=8)
-                if r.status_code == 200:
-                    self.endpoints["link_nonce"] = url
-                    save_endpoints(self.endpoints)
-                    return r.json()
-                r = self.session.post(url, json={"address": address}, timeout=8)
-                if r.status_code == 200:
-                    self.endpoints["link_nonce"] = url
-                    save_endpoints(self.endpoints)
-                    return r.json()
-            except Exception:
-                continue
+    def first_claim(self, address: str) -> dict | None:
+        """GET reward/first-claim/{address} — returns {allocation, initialClaim:{3,6,9}, contractAllocation:{3,6,9}}."""
+        try:
+            r = self._get(METAGAME_API, EP_FIRSTCLAIM(address), auth=False)
+            if r.status_code == 200:
+                return r.json()
+            log(f"  first-claim status={r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            log(f"  first-claim err: {e}")
         return None
 
-    def link_wallet(self, address: str, signature: str, message: str) -> bool:
-        candidates = self.endpoints.get("link_wallet", []) or [
-            f"{OF_API}/fanpass-service/v1/wallet/link",
-            f"{OF_API}/fanpass-service/v1/airdrop/link-wallet",
-            f"{OF_API}/users-accounts-api/v1/wallets",
-        ]
-        if isinstance(candidates, str):
-            candidates = [candidates]
-        for url in candidates:
-            try:
-                r = self.session.post(url, json={"address": address, "signature": signature, "message": message}, timeout=8)
-                if r.status_code < 300:
-                    self.endpoints["link_wallet"] = url
-                    save_endpoints(self.endpoints)
-                    return True
-            except Exception:
-                continue
-        return False
+    def vesting(self, address: str) -> dict | None:
+        """GET reward/vesting/{address} — vesting state."""
+        try:
+            r = self._get(METAGAME_API, EP_VESTING(address), auth=False)
+            if r.status_code == 200:
+                return r.json()
+            log(f"  vesting status={r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            log(f"  vesting err: {e}")
+        return None
 
-    def claim_auth(self, address: str) -> dict | None:
-        """Get claim authorization (merkle proof / voucher / contract data)."""
-        candidates = self.endpoints.get("claim_auth", []) or [
-            f"{OF_API}/fanpass-service/v1/airdrop/claim",
-            f"{OF_API}/fanpass-service/v1/claim",
-            f"{OF_API}/fanpass-service/v1/airdrop/{address}",
-            f"{OF_API}/fanpass-service/v1/eligibility",
-        ]
-        if isinstance(candidates, str):
-            candidates = [candidates]
-        for url in candidates:
-            try:
-                u = url.replace("{address}", address)
-                r = self.session.get(u, params={"address": address}, timeout=8)
-                if r.status_code == 200:
-                    self.endpoints["claim_auth"] = url
-                    save_endpoints(self.endpoints)
-                    return r.json()
-                r = self.session.post(u, json={"address": address}, timeout=8)
-                if r.status_code == 200:
-                    self.endpoints["claim_auth"] = url
-                    save_endpoints(self.endpoints)
-                    return r.json()
-            except Exception:
-                continue
+    def merkle_signature(self, address: str) -> dict | None:
+        """GET merkle-rewards/signature/{address} — returns {index, amount, proof[]}. AUTH required."""
+        try:
+            r = self._get(METAGAME_API, EP_SIGNATURE(address), auth=True)
+            if r.status_code == 200:
+                return r.json()
+            log(f"  merkle-signature status={r.status_code}: {r.text[:300]}")
+        except Exception as e:
+            log(f"  merkle-signature err: {e}")
+        return None
+
+    def claim_status(self) -> dict | None:
+        try:
+            r = self._get(METAGAME_API, EP_CLAIMSTATUS, auth=True)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
         return None
 
 # ---------- Web3 tx helpers ----------
@@ -819,93 +889,138 @@ async def playwright_recon_claim(address: str) -> dict | None:
 
     return result
 
-# ---------- Per-wallet flow (pure HTTP) ----------
+# ---------- Per-wallet flow (pure HTTP, REAL endpoints) ----------
+# Claim contract instance (re-used)
+_claim_contract = w3.eth.contract(address=Web3.to_checksum_address(CLAIM_CONTRACT), abi=CLAIM_ABI)
+
+def build_claim_tx_from_merkle(pk: str, merkle_data: dict, vesting_months: int, claim_fee_wei: int) -> dict:
+    """Build the claim() tx using real ABI + merkle proof from API."""
+    acct = Account.from_key(pk)
+    index = int(merkle_data["index"])
+    amount = int(merkle_data["amount"])
+    proof = [bytes.fromhex(p[2:] if p.startswith("0x") else p) for p in merkle_data["proof"]]
+
+    base_gas = get_current_gas()
+    gas_price = max(int(base_gas * GAS_MULT_CLAIM), int(0.1 * 1e9))
+    nonce = w3.eth.get_transaction_count(acct.address)
+
+    tx = _claim_contract.functions.claim(index, amount, vesting_months, proof).build_transaction({
+        "from": acct.address,
+        "value": int(claim_fee_wei * 1.15),  # 15% buffer for price fluctuation (matches JS)
+        "nonce": nonce,
+        "chainId": BASE_CHAIN_ID,
+        "gas": 350_000,  # generous limit
+        "maxFeePerGas": gas_price,
+        "maxPriorityFeePerGas": int(gas_price * 0.5),
+    })
+    return tx
+
+def get_claim_fee_eth() -> int:
+    """Returns current claim fee in wei from contract."""
+    try:
+        return _claim_contract.functions.getClaimFeeInEth().call()
+    except Exception as e:
+        log(f"  getClaimFeeInEth err: {e}")
+        return int(0.0005 * 1e18)  # fallback ~$1
+
+def check_eligibility_onchain(addr: str, merkle_data: dict) -> tuple[bool, list]:
+    """Verify merkle proof on-chain BEFORE broadcasting claim tx."""
+    try:
+        index = int(merkle_data["index"])
+        amount = int(merkle_data["amount"])
+        proof = [bytes.fromhex(p[2:] if p.startswith("0x") else p) for p in merkle_data["proof"]]
+        result = _claim_contract.functions.checkEligibility(index, addr, amount, proof).call()
+        return result[0], result[1]  # (eligible: bool, [3, 6, 9 amounts])
+    except Exception as e:
+        log(f"  checkEligibility err: {e}")
+        return False, []
+
 def process_wallet(client: OFClient, addr: str, pk: str, dest: str):
     log(f"\n[bold cyan]═══ Wallet: {addr} ═══[/bold cyan]")
 
-    # 1. Show ETH balance
+    # 1. Show ETH balance + claim fee requirement
+    bal_wei = 0
     try:
-        bal = w3.eth.get_balance(addr) / 1e18
-        log(f"  ETH balance: {fmt_eth_idr(bal)}")
-        if bal < 0.00005:
-            log(f"  [red]⚠️  Saldo ETH terlalu kecil untuk bayar gas. Top-up dulu min 0.0001 ETH ke {addr}[/red]")
+        bal_wei = w3.eth.get_balance(addr)
+        bal_eth = bal_wei / 1e18
+        log(f"  ETH balance: {fmt_eth_idr(bal_eth)}")
     except Exception as e:
         log(f"  ETH balance err: {e}")
 
-    # 2. Fetch fanpass token (allocation)
-    log("  [dim]Fetch allocation dari OneFootball API...[/dim]")
-    token_resp = client.fanpass_token()
-    if not token_resp:
-        log("  [red]Tidak bisa fetch /fanpass-service/v1/token. Sesi mungkin expired atau API berubah.[/red]")
+    claim_fee = get_claim_fee_eth()
+    claim_fee_with_buffer = int(claim_fee * 1.15)
+    estimated_gas = 350_000 * int(get_current_gas() * GAS_MULT_CLAIM)
+    total_needed = claim_fee_with_buffer + estimated_gas
+    log(f"  Claim fee: {fmt_eth_idr(claim_fee/1e18)} (+ 15% buffer = {fmt_eth_idr(claim_fee_with_buffer/1e18)})")
+    log(f"  Est. gas:  {fmt_eth_idr(estimated_gas/1e18)}")
+    log(f"  TOTAL needed (claim fee + gas): {fmt_eth_idr(total_needed/1e18)}")
+
+    if bal_wei < total_needed:
+        short = (total_needed - bal_wei) / 1e18
+        log(f"  [red]⚠️  Saldo kurang. Kirim {fmt_eth_idr(short)} lagi ke {addr}[/red]")
+        log(f"  [yellow]Skip wallet ini (tidak cukup ETH).[/yellow]")
         return
 
-    log(f"  [dim]Token response:[/dim] {json.dumps(token_resp, indent=2)[:500]}")
+    # 2. Check eligibility via API
+    log("  [dim]Cek eligibility via reward/status/...[/dim]")
+    status = client.reward_status(addr)
+    if not status:
+        log("  [red]Cannot fetch reward/status. Sesi expired? Hapus session.json dan re-login.[/red]")
+        return
+    log(f"  status: code={status.get('code')} message={status.get('message')}")
+    if status.get("code") != 2:
+        log(f"  [yellow]Address not eligible (code={status.get('code')}). Skip.[/yellow]")
+        return
 
-    # 3. Try claim_auth
-    claim_data = client.claim_auth(addr)
-    if claim_data:
-        log(f"  [dim]Claim auth response:[/dim] {json.dumps(claim_data, indent=2)[:500]}")
-    else:
-        log("  [yellow]Claim auth endpoint belum ke-discover. Mungkin perlu link wallet dulu.[/yellow]")
+    # 3. Get first-claim allocation
+    fc = client.first_claim(addr)
+    if not fc:
+        log("  [red]Cannot fetch first-claim. Skip.[/red]")
+        return
+    log(f"  Allocation: {fc.get('allocation')} OFC (raw)")
+    initial_options = fc.get("initialClaim", {})
+    contract_options = fc.get("contractAllocation", {})
+    log(f"  Initial claim options (3/6/9 months): {initial_options}")
+    log(f"  Contract allocation (3/6/9 months):   {contract_options}")
 
-    # 4. Link wallet if needed
-    if not claim_data:
-        log("  [dim]Coba link wallet ke OneFootball account...[/dim]")
-        nonce_resp = client.link_wallet_nonce(addr)
-        if nonce_resp:
-            msg = nonce_resp.get("message") or nonce_resp.get("nonce") or json.dumps(nonce_resp)
-            sig = sign_message(pk, msg)
-            ok = client.link_wallet(addr, "0x" + sig if not sig.startswith("0x") else sig, msg)
-            log(f"  Link wallet: {'OK' if ok else 'failed'}")
-            if ok:
-                claim_data = client.claim_auth(addr)
+    # 4. Get merkle proof from API
+    log("  [dim]Fetch merkle proof (signature endpoint)...[/dim]")
+    merkle = client.merkle_signature(addr)
+    if not merkle:
+        log("  [red]Cannot fetch merkle proof. Skip.[/red]")
+        return
+    log(f"  merkle: index={merkle.get('index')} amount={merkle.get('amount')} proof_len={len(merkle.get('proof', []))}")
 
-    if not claim_data or not claim_data.get("contract_address") or not claim_data.get("calldata"):
-        log("  [red]Claim data tidak lengkap. Auto-recon via Playwright dibutuhkan.[/red]")
-        log("  [yellow]Browser akan terbuka. Klik tombol Claim di halaman SEKALI.[/yellow]")
-        log("  [yellow]Script akan capture API call & contract address otomatis.[/yellow]")
-        ans = input("  Lanjut auto-recon? [y/N]: ").strip().lower()
-        if ans != "y":
-            log("  [yellow]Skipped.[/yellow]")
-            return
-        recon_result = asyncio.run(playwright_recon_claim(addr))
-        if recon_result:
-            # Save discovered endpoints
-            current_endpoints = load_endpoints()
-            current_endpoints.update(recon_result.get("endpoints", {}))
-            if recon_result.get("contract_address"):
-                current_endpoints["contract_address"] = recon_result["contract_address"]
-            save_endpoints(current_endpoints)
-            # Try again with discovered endpoints
-            claim_data = {
-                "contract_address": recon_result["contract_address"],
-                "calldata": recon_result["calldata"],
-                "chain_id": recon_result.get("chain_id", BASE_CHAIN_ID),
-                "value": recon_result.get("value", 0),
-                "gas_limit": recon_result.get("gas_limit"),
-            }
-            if recon_result.get("token_address"):
-                claim_data["token_address"] = recon_result["token_address"]
-            if recon_result.get("amount"):
-                claim_data["amount"] = recon_result["amount"]
-            log("  [green]Endpoint ter-discover. Lanjut claim via pure HTTP.[/green]")
-        else:
-            log("  [red]Auto-recon gagal. Tidak bisa lanjut.[/red]")
-            return
+    # 5. Verify on-chain BEFORE broadcast
+    eligible, three_options = check_eligibility_onchain(addr, merkle)
+    log(f"  [dim]On-chain eligibility check: eligible={eligible} amounts={three_options}[/dim]")
+    if not eligible:
+        log("  [red]On-chain check says NOT eligible. Stopping.[/red]")
+        return
 
-    # 5. Build claim tx
+    # 6. Pick vesting months — default to 3 months (fastest unlock)
+    # User can override via env var OFC_VESTING_MONTHS
+    months = int(os.environ.get("OFC_VESTING_MONTHS", "3"))
+    if months not in (3, 6, 9):
+        log(f"  [yellow]Invalid vesting months {months}, fallback to 3[/yellow]")
+        months = 3
+    chosen_initial = initial_options.get(str(months), 0) if isinstance(initial_options, dict) else 0
+    log(f"  Vesting months: [bold]{months}[/bold] → initial claim: {chosen_initial} OFC")
+
+    # 7. Build claim tx
     try:
-        tx = build_claim_tx(pk, claim_data)
+        tx = build_claim_tx_from_merkle(pk, merkle, months, claim_fee)
         gas_eth = tx["gas"] * tx["maxFeePerGas"] / 1e18
-        log(f"  Estimasi gas claim: {fmt_eth_idr(gas_eth)}")
+        value_eth = tx["value"] / 1e18
+        log(f"  Gas budget: {fmt_eth_idr(gas_eth)}")
+        log(f"  Value attached: {fmt_eth_idr(value_eth)}")
     except Exception as e:
         log(f"  [red]Build tx error: {e}[/red]")
         return
 
-    # 6. Display + confirm
-    amount_display = claim_data.get("amount") or token_resp.get("amount") or "?"
-    log(f"\n  [bold]>>> Siap claim:[/bold] {amount_display} OFC ke {addr}")
-    log(f"  [bold]>>> Lalu sweep ke:[/bold] {dest}")
+    # Save token address for sweep later
+    claim_data = {"token_address": OFC_TOKEN, "amount": chosen_initial}
+    token_resp = fc  # for compat with later code
     ans = input(f"\n  Lanjut? [y/N]: ").strip().lower()
     if ans != "y":
         log("  [yellow]Skipped by user.[/yellow]")

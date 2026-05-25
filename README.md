@@ -16,15 +16,24 @@ Auto-claim airdrop OneFootball FanPass (OFC) lalu **langsung sweep** ke wallet b
 
 - **Playwright HANYA untuk login Google** (one-time per session). Setelah session.json terbentuk, browser tidak dipakai lagi.
 - **Claim murni via HTTP requests + web3.py** — cepat (<1 detik per request) tanpa overhead browser.
-- **Auto-discovery API** via Playwright recon-wallet (one-time per endpoint set). Script meng-inject custom `window.ethereum` yang menangkap params `eth_sendTransaction` tanpa broadcast — sehingga kita belajar contract address + calldata dari klik Claim asli user.
-- **Login detection akurat** — verifikasi via API call (`/users-accounts-api/v1/settings/profile`), bukan heuristic cookie.
+- **Endpoint REAL** (bukan tebakan) — di-extract langsung dari production JS bundle OneFootball:
+  - Auth check: `https://api.onefootball.com/users-accounts-api/v1/settings`
+  - Eligibility: `https://api.onefootball.com/fanpass-metagame-backend/reward/status/{address}`
+  - Allocation: `https://api.onefootball.com/fanpass-metagame-backend/reward/first-claim/{address}`
+  - Merkle proof: `https://api.onefootball.com/fanpass-metagame-backend/merkle-rewards/signature/{address}` (Bearer auth)
+- **Contract addresses verified on-chain (Base):**
+  - Airdrop contract (claim): [`0x06821F0A313871eBDCD5B2D4A56f2b7dB8853B00`](https://basescan.org/address/0x06821F0A313871eBDCD5B2D4A56f2b7dB8853B00)
+  - OFC token (ERC-20): [`0x752C5a95d202972E124390F30a50154409d3c858`](https://basescan.org/address/0x752C5a95d202972E124390F30a50154409d3c858)
+  - Claim fee: `getClaimFeeInEth()` ~$1 in ETH (currently ~0.00047 ETH) + 15% buffer
+  - ABI extracted from prod bundle → `cp_abi.json` (84 functions/events)
+- **Login detection akurat** — verifikasi via API call (`v1/settings`), bukan heuristic cookie.
 
 ## Setup
 
 ```bash
-git clone https://github.com/wiwokthetok/ofc.git   # ganti dengan nama repo kamu
+git clone https://github.com/wiwokthetok/ofc.git
 cd ofc
-pip install playwright web3 eth-account requests rich
+pip install playwright web3 eth-account requests rich aiohttp
 python -m playwright install chromium
 
 # config
@@ -32,6 +41,26 @@ cp ok.txt.example ok.txt && nano ok.txt        # 1 private key per baris
 cp adres.txt.example adres.txt && nano adres.txt  # 1 address wallet bersih
 
 python p.py
+```
+
+## Akses VPS dari Termux Android (login Google headless)
+
+Saat script run pertama kali di VPS tanpa GUI, ia akan auto-install Xvfb + x11vnc + noVNC dan listen di `localhost:6080` (bukan di public IP — lebih aman). Untuk akses dari HP:
+
+```bash
+# Di Termux Android — buka SSH session BARU (jangan tutup yg sedang run script):
+ssh -L 6080:localhost:6080 root@VPS_IP
+
+# Setelah tunnel jalan, buka browser di HP Android:
+#   http://localhost:6080/vnc.html?host=localhost&port=6080&autoconnect=true
+# Password VNC akan ditampilkan di output script.
+```
+
+Kalau VPS-nya tidak punya `apt-get` (Termux native, Alpine, dll), script akan kasih instruksi install manual + fallback: login di laptop dulu lalu `scp session.json + ofc_profile/` ke VPS.
+
+**Vesting months** — default 3 bulan (tercepat unlock). Override via env var:
+```bash
+OFC_VESTING_MONTHS=6 python p.py   # atau 9
 ```
 
 ## Flow
@@ -49,19 +78,24 @@ python p.py
 2. Kalau valid → langsung ke claim phase (no browser)
 3. Kalau expired → re-login (Playwright sekali lagi)
 
-### Claim phase per wallet
+### Claim phase per wallet (REAL flow, real endpoints)
 
-1. GET `/fanpass-service/v1/token` → ambil allocation OFC + claim data
-2. Sign message (jika perlu link wallet baru)
-3. Build claim() tx via web3.py, gas 1.5× current network rate
-4. Tampilkan: address, jumlah OFC, gas estimate (ETH + IDR real-time)
-5. Tanya `y/n`
-6. Broadcast claim tx via Base RPC
-7. Tunggu OFC masuk (poll balance, max 2 menit)
-8. IMMEDIATELY broadcast:
-   - OFC transfer ke `adres.txt`
-   - Sisa ETH sweep ke `adres.txt`
-   - Gas 2× network rate untuk race-mode
+1. **Check ETH balance vs claim fee + gas** — kalau kurang, skip wallet
+2. **GET `reward/status/{addr}`** — code==2 = eligible
+3. **GET `reward/first-claim/{addr}`** — `{allocation, initialClaim:{3,6,9}, contractAllocation:{3,6,9}}`
+4. **GET `merkle-rewards/signature/{addr}`** (Bearer auth) — `{index, amount, proof[]}`
+5. **On-chain `checkEligibility(index, addr, amount, proof)`** — verify proof BEFORE broadcast (saves gas)
+6. **Build `claim(index, amount, vestingMonths, proof)` tx** via web3.py + ABI:
+   - value = `getClaimFeeInEth() * 1.15`
+   - gas = 350k, gasPrice = 3× network
+7. **Pre-sign** bundle (claim + sweep) BEFORE prompt
+8. Tampilkan: allocation, gas estimate ETH+IDR, total ETH needed
+9. Tanya `y/n`
+10. **Multi-RPC parallel broadcast** ke 7 Base RPCs simultan
+11. Tunggu confirmation (~2s pada Base)
+12. **IMMEDIATELY sweep** (parallel multi-RPC, 4× gas) ke `adres.txt`:
+   - OFC token transfer
+   - Sisa ETH transfer
 
 ## File
 
@@ -71,7 +105,8 @@ python p.py
 | `ok.txt` | Private keys (1 per baris) | **TIDAK** (di-gitignore) |
 | `adres.txt` | Wallet tujuan (1 address) | **TIDAK** (di-gitignore) |
 | `session.json` | Cookies OneFootball + auth | **TIDAK** (di-gitignore) |
-| `endpoints.json` | API endpoints discovered (cache) | **TIDAK** (di-gitignore) |
+| `cp_abi.json` | Claim contract ABI (extracted from prod bundle) | ya |
+| `endpoints.json` | Extra endpoint cache (jika auto-recon dipakai) | **TIDAK** (di-gitignore) |
 | `ofc_profile/` | Playwright profile (browser state) | **TIDAK** (di-gitignore) |
 | `ofc.log` | Log per aksi | **TIDAK** (di-gitignore) |
 
@@ -126,8 +161,8 @@ python p.py
 
 ## Catatan teknis
 
-- **Login detection:** HIT `https://api.onefootball.com/users-accounts-api/v1/settings/profile`. 200 = login, lain = belum. Tidak pakai heuristic cookie name.
-- **Auto-discovery API:** mencoba beberapa URL kandidat untuk tiap endpoint (`/wallet/link`, `/airdrop/claim`, `/eligibility`, dll) sampai 200. URL yang work disimpan ke `endpoints.json`.
+- **Login detection:** HIT `https://api.onefootball.com/users-accounts-api/v1/settings`. 200 = login, lain = belum. Tidak pakai heuristic cookie name.
+- **Endpoint discovery:** semua endpoint di-extract dari production JS bundle (lihat `cp_abi.json` & inline constants di `p.py`). Tidak ada tebakan/trial-and-error.
 - **Race-mode sweep:** gas claim 1.5× network, gas sweep 2.0× network. Sweeper bot drainer biasanya pakai 1.5× — kalah priority.
 - **Sweep ordering:** broadcast 2 tx (OFC transfer dengan nonce N, ETH sweep dengan nonce N+1). Keduanya masuk block yang sama atau berurutan.
 
