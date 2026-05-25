@@ -43,7 +43,7 @@ def _ensure(pkg, mod=None):
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 for pkg, mod in [("playwright", "playwright"), ("web3", "web3"), ("eth-account", "eth_account"),
-                 ("requests", "requests"), ("rich", "rich")]:
+                 ("requests", "requests"), ("rich", "rich"), ("aiohttp", "aiohttp")]:
     _ensure(pkg, mod)
 
 import requests
@@ -68,8 +68,22 @@ CLAIM_URL    = "https://fanpass.onefootball.com/airdrop-claim"
 OF_API       = "https://api.onefootball.com"
 PROFILE_API  = f"{OF_API}/users-accounts-api/v1/settings/profile"
 
-BASE_RPC     = "https://base-rpc.publicnode.com"
+# Multi-RPC for parallel broadcast (race-mode: first confirms wins)
+BASE_RPCS = [
+    "https://base.drpc.org",                  # fastest in test (91ms)
+    "https://base-rpc.publicnode.com",         # reliable (165ms)
+    "https://mainnet.base.org",                # official (140ms)
+    "https://base.meowrpc.com",
+    "https://base-pokt.nodies.app",
+    "https://base.gateway.tenderly.co",
+    "https://developer-access-mainnet.base.org",
+]
+BASE_RPC     = BASE_RPCS[0]
 BASE_CHAIN_ID = 8453
+
+# Gas multipliers — race-mode (sweeper bot drainer biasanya pakai 1.5x)
+GAS_MULT_CLAIM = 3.0
+GAS_MULT_SWEEP = 4.0
 
 ERC20_ABI = [
     {"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
@@ -83,7 +97,7 @@ ERC20_ABI = [
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
 console = Console()
-w3 = Web3(Web3.HTTPProvider(BASE_RPC))
+w3 = Web3(Web3.HTTPProvider(BASE_RPC, request_kwargs={"timeout": 10}))
 
 # ---------- Logging ----------
 def log(msg: str):
@@ -443,39 +457,102 @@ def sign_message(pk: str, message: str) -> str:
     msg = encode_defunct(text=message)
     return Account.from_key(pk).sign_message(msg).signature.hex()
 
-def build_claim_tx(pk: str, claim_data: dict) -> dict:
+def get_current_gas() -> int:
+    """Current network gas price (wei). Tries multiple RPCs."""
+    for rpc in BASE_RPCS[:3]:
+        try:
+            r = requests.post(rpc, json={"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1}, timeout=3)
+            return int(r.json()["result"], 16)
+        except Exception:
+            continue
+    return int(0.05 * 1e9)  # 0.05 gwei fallback (Base typical)
+
+def build_claim_tx(pk: str, claim_data: dict, nonce: int | None = None, gas_mult: float = GAS_MULT_CLAIM) -> dict:
     """
     Build the on-chain claim() call.
-    claim_data keys (best-effort, real names from API will be auto-discovered):
+    claim_data keys:
       - contract_address
-      - calldata (hex string starting with 0x — full tx data including selector + args)
+      - calldata (hex string starting with 0x)
       - chain_id (default Base 8453)
       - gas_limit (optional)
+      - value (optional, default 0)
     """
     acct = Account.from_key(pk)
     chain_id = claim_data.get("chain_id", BASE_CHAIN_ID)
     contract = Web3.to_checksum_address(claim_data["contract_address"])
     calldata = claim_data["calldata"]
-    gas_price = int(w3.eth.gas_price * 1.5)
-    nonce = w3.eth.get_transaction_count(acct.address)
+    base_gas = get_current_gas()
+    gas_price = max(int(base_gas * gas_mult), int(0.1 * 1e9))  # min 0.1 gwei
+    if nonce is None:
+        nonce = w3.eth.get_transaction_count(acct.address)
     gas_limit = claim_data.get("gas_limit") or 300_000
-    tx = {
+    return {
         "to": contract,
         "data": calldata,
-        "value": 0,
+        "value": claim_data.get("value", 0),
         "nonce": nonce,
         "chainId": chain_id,
         "gas": gas_limit,
         "maxFeePerGas": gas_price,
-        "maxPriorityFeePerGas": int(gas_price * 0.3),
+        "maxPriorityFeePerGas": int(gas_price * 0.5),
     }
-    return tx
 
-def send_signed(pk: str, tx: dict) -> str:
+def sign_tx(pk: str, tx: dict) -> str:
+    """Returns raw signed tx hex."""
     acct = Account.from_key(pk)
     signed = acct.sign_transaction(tx)
-    h = w3.eth.send_raw_transaction(signed.raw_transaction)
-    return h.hex()
+    return signed.raw_transaction.hex()
+
+async def _post_rpc(rpc: str, raw: str, session) -> dict:
+    """Send raw tx to one RPC. Returns dict with tx_hash or error."""
+    body = {"jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [raw if raw.startswith("0x") else "0x" + raw], "id": 1}
+    try:
+        async with session.post(rpc, json=body, timeout=6) as r:
+            j = await r.json()
+            if "result" in j:
+                return {"rpc": rpc, "tx_hash": j["result"]}
+            return {"rpc": rpc, "error": j.get("error", {}).get("message", "?")}
+    except Exception as e:
+        return {"rpc": rpc, "error": str(e)[:80]}
+
+async def broadcast_parallel(raw: str) -> tuple[str | None, list]:
+    """Broadcast raw tx to ALL Base RPCs simultaneously. Returns first tx_hash + all results."""
+    import aiohttp
+    async with aiohttp.ClientSession() as s:
+        tasks = [asyncio.create_task(_post_rpc(rpc, raw, s)) for rpc in BASE_RPCS]
+        results = []
+        tx_hash = None
+        for fut in asyncio.as_completed(tasks):
+            res = await fut
+            results.append(res)
+            if res.get("tx_hash") and not tx_hash:
+                tx_hash = res["tx_hash"]
+                # don't break — let others finish for redundancy
+        return tx_hash, results
+
+def broadcast_parallel_sync(raw: str) -> tuple[str | None, list]:
+    """Sync wrapper."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # already in async context
+            raise RuntimeError("sync called from async")
+    except RuntimeError:
+        pass
+    return asyncio.run(broadcast_parallel(raw))
+
+def send_signed(pk: str, tx: dict) -> str:
+    """Sign + broadcast via multi-RPC parallel. Returns tx_hash."""
+    raw = sign_tx(pk, tx)
+    h, results = broadcast_parallel_sync(raw)
+    # log all RPC results
+    success_count = sum(1 for r in results if r.get("tx_hash"))
+    log(f"  [dim]Broadcast: {success_count}/{len(results)} RPCs accepted[/dim]")
+    if not h:
+        for r in results[:3]:
+            log(f"  [dim]  {r['rpc']}: {r.get('error', 'no result')[:80]}[/dim]")
+        raise RuntimeError("All RPCs rejected tx")
+    return h
 
 def pre_sign_sweep_txs(pk: str, dest: str, ofc_token_addr: str | None, claim_nonce: int) -> list[dict]:
     """Pre-build OFC transfer + ETH sweep txs with nonces claim_nonce+1 and +2."""
@@ -497,56 +574,250 @@ def pre_sign_sweep_txs(pk: str, dest: str, ofc_token_addr: str | None, claim_non
     })
     return out
 
-def execute_sweep(pk: str, dest: str, ofc_token_addr: str | None) -> dict:
-    """Execute OFC transfer + ETH sweep immediately."""
+def execute_sweep(pk: str, dest: str, ofc_token_addr: str | None, expected_ofc_amount: int | None = None) -> dict:
+    """Execute OFC transfer + ETH sweep with MULTI-RPC parallel broadcast."""
     out = {}
     acct = Account.from_key(pk)
     from_addr = acct.address
+    base_gas = get_current_gas()
+    gas_price = max(int(base_gas * GAS_MULT_SWEEP), int(0.2 * 1e9))
+
+    nonce = w3.eth.get_transaction_count(from_addr)
 
     if ofc_token_addr:
         try:
             tok = w3.eth.contract(address=Web3.to_checksum_address(ofc_token_addr), abi=ERC20_ABI)
-            bal = tok.functions.balanceOf(from_addr).call()
+            # Try to use known amount first (faster — no RPC roundtrip)
+            bal = expected_ofc_amount
+            if bal is None or bal <= 0:
+                bal = tok.functions.balanceOf(from_addr).call()
             if bal > 0:
-                gas_price = int(w3.eth.gas_price * 2.0)
-                nonce = w3.eth.get_transaction_count(from_addr)
                 tx = tok.functions.transfer(dest, bal).build_transaction({
                     "from": from_addr,
                     "nonce": nonce,
                     "chainId": BASE_CHAIN_ID,
                     "gas": 80_000,
                     "maxFeePerGas": gas_price,
-                    "maxPriorityFeePerGas": int(gas_price * 0.5),
+                    "maxPriorityFeePerGas": int(gas_price * 0.8),
                 })
-                signed = acct.sign_transaction(tx)
-                h = w3.eth.send_raw_transaction(signed.raw_transaction)
-                out["ofc_transfer"] = h.hex()
-                log(f"  [green]→ OFC transfer broadcast:[/green] {h.hex()} ({bal})")
+                raw = sign_tx(pk, tx)
+                h, results = broadcast_parallel_sync(raw)
+                ok = sum(1 for r in results if r.get("tx_hash"))
+                out["ofc_transfer"] = h
+                log(f"  [green]→ OFC transfer:[/green] {h} ({ok}/{len(results)} RPCs, amt={bal})")
+                nonce += 1
             else:
                 log("  [yellow]OFC balance 0, skip transfer[/yellow]")
         except Exception as e:
             log(f"  [yellow]OFC transfer skipped: {e}[/yellow]")
 
     try:
-        gas_price = int(w3.eth.gas_price * 2.0)
         gas_cost = 21000 * gas_price
         eth_bal = w3.eth.get_balance(from_addr)
         amt = eth_bal - gas_cost
         if amt > 0:
-            nonce = w3.eth.get_transaction_count(from_addr)
             tx = {
                 "to": dest, "value": amt, "nonce": nonce, "chainId": BASE_CHAIN_ID,
-                "gas": 21000, "maxFeePerGas": gas_price, "maxPriorityFeePerGas": int(gas_price * 0.5),
+                "gas": 21000, "maxFeePerGas": gas_price, "maxPriorityFeePerGas": int(gas_price * 0.8),
             }
-            signed = acct.sign_transaction(tx)
-            h = w3.eth.send_raw_transaction(signed.raw_transaction)
-            out["eth_sweep"] = h.hex()
-            log(f"  [green]→ ETH sweep broadcast:[/green] {h.hex()}  ({amt/1e18:.8f} ETH)")
+            raw = sign_tx(pk, tx)
+            h, results = broadcast_parallel_sync(raw)
+            ok = sum(1 for r in results if r.get("tx_hash"))
+            out["eth_sweep"] = h
+            log(f"  [green]→ ETH sweep:[/green] {h} ({ok}/{len(results)} RPCs, {amt/1e18:.8f} ETH)")
         else:
             log(f"  [yellow]ETH balance ({eth_bal/1e18:.8f}) ≤ gas cost, skip sweep[/yellow]")
     except Exception as e:
         log(f"  [red]ETH sweep error: {e}[/red]")
     return out
+
+# ---------- Auto-recon via Playwright (one-time per endpoint) ----------
+def make_recon_wallet_js(address: str, chain_id: int = BASE_CHAIN_ID, rpc: str = BASE_RPC) -> str:
+    """
+    Injected wallet that captures eth_sendTransaction params instead of broadcasting.
+    The TX data tells us exactly which contract + calldata is needed for claim.
+    """
+    return f"""
+    (() => {{
+      const ADDR = "{address.lower()}";
+      const CHAIN_HEX = "0x{chain_id:x}";
+      const RPC = "{rpc}";
+      window.__capturedTxs = [];
+      const listeners = new Map();
+
+      async function rpcCall(method, params) {{
+        const r = await fetch(RPC, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ jsonrpc: "2.0", id: 1, method, params }})
+        }});
+        const j = await r.json();
+        return j.result;
+      }}
+
+      const provider = {{
+        isMetaMask: true,
+        isConnected: () => true,
+        chainId: CHAIN_HEX,
+        selectedAddress: ADDR,
+        networkVersion: String({chain_id}),
+
+        async request({{ method, params = [] }}) {{
+          if (method === "eth_accounts" || method === "eth_requestAccounts") return [ADDR];
+          if (method === "eth_chainId") return CHAIN_HEX;
+          if (method === "net_version") return String({chain_id});
+          if (method === "wallet_switchEthereumChain") return null;
+          if (method === "wallet_addEthereumChain") return null;
+          if (method === "wallet_getPermissions" || method === "wallet_requestPermissions") {{
+            return [{{ parentCapability: "eth_accounts", caveats: [{{ type: "restrictReturnedAccounts", value: [ADDR] }}] }}];
+          }}
+
+          if (method === "eth_sendTransaction") {{
+            // CAPTURE THE TX (don't broadcast)
+            const tx = params[0];
+            window.__capturedTxs.push({{ method, tx, captured_at: Date.now() }});
+            console.log("[RECON] Captured eth_sendTransaction:", tx);
+            // Return fake hash so dApp continues normally
+            return "0x" + "0".repeat(64);
+          }}
+          if (method === "personal_sign" || method === "eth_sign" || method.startsWith("eth_signTypedData")) {{
+            // Just return fake signature for recon
+            window.__capturedTxs.push({{ method, params, captured_at: Date.now() }});
+            return "0x" + "0".repeat(130);
+          }}
+          return await rpcCall(method, params);
+        }},
+        on(event, fn) {{ if (!listeners.has(event)) listeners.set(event, []); listeners.get(event).push(fn); }},
+        removeListener(event, fn) {{ if (!listeners.has(event)) return; listeners.set(event, listeners.get(event).filter(x => x !== fn)); }},
+      }};
+
+      Object.defineProperty(window, "ethereum", {{ value: provider, writable: false, configurable: false }});
+      window.dispatchEvent(new Event("ethereum#initialized"));
+      const info = {{ uuid: "recon-ofc-uuid", name: "OFC Recon", icon: "data:image/svg+xml;base64,PHN2Zy8+", rdns: "ofc.recon" }};
+      window.dispatchEvent(new CustomEvent("eip6963:announceProvider", {{ detail: {{ info, provider }} }}));
+      window.addEventListener("eip6963:requestProvider", () => {{
+        window.dispatchEvent(new CustomEvent("eip6963:announceProvider", {{ detail: {{ info, provider }} }}));
+      }});
+      console.log("[OFC recon] wallet installed");
+    }})();
+    """
+
+async def playwright_recon_claim(address: str) -> dict | None:
+    """
+    Open browser, inject recon-wallet, wait for user to click Claim.
+    Capture the eth_sendTransaction → that's the actual claim contract + calldata.
+    Also intercept all API calls to api.onefootball.com for endpoint discovery.
+    """
+    from playwright.async_api import async_playwright
+    ensure_chromium()
+    can_headed = setup_novnc_if_needed()
+    PROFILE_DIR.mkdir(exist_ok=True)
+
+    api_calls = []
+    inject_js = make_recon_wallet_js(address)
+
+    async with async_playwright() as p:
+        ctx = await p.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=not can_headed,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 800},
+            user_agent=UA,
+        )
+        page = await ctx.new_page()
+        await page.add_init_script(inject_js)
+
+        # Intercept API responses for endpoint discovery
+        async def on_response(resp):
+            try:
+                url = resp.url
+                if "api.onefootball.com" not in url:
+                    return
+                ct = resp.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+                data = None
+                try:
+                    data = await resp.json()
+                except Exception:
+                    return
+                api_calls.append({"url": url, "method": resp.request.method, "status": resp.status, "data": data})
+            except Exception:
+                pass
+        page.on("response", on_response)
+
+        await page.goto(CLAIM_URL, wait_until="domcontentloaded", timeout=60000)
+
+        console.print(Panel.fit(
+            "[yellow]>>> RECON MODE <<<[/yellow]\n"
+            f"  1. Pastikan kamu sudah login (kalau belum, login dulu)\n"
+            f"  2. Connect wallet → pilih [bold]Browser Wallet[/bold] / [bold]MetaMask[/bold]\n"
+            f"     (sebenarnya itu wallet recon kita yang ke-inject)\n"
+            f"  3. Klik tombol [bold]Claim[/bold]\n"
+            f"  4. Script auto-capture tx data, lalu browser tutup.\n\n"
+            f"[dim]Wallet recon: {address}[/dim]",
+            title="AUTO-RECON CLAIM API", border_style="yellow"
+        ))
+
+        # Poll for captured tx (max 5 min)
+        deadline = time.time() + 300
+        captured = None
+        with Progress(SpinnerColumn(), TextColumn("[cyan]Menunggu user klik Claim...[/cyan]"),
+                      transient=True, console=console) as prog:
+            prog.add_task("recon", total=None)
+            while time.time() < deadline:
+                txs = await page.evaluate("() => window.__capturedTxs || []")
+                # Look for eth_sendTransaction
+                for entry in txs:
+                    if entry.get("method") == "eth_sendTransaction":
+                        captured = entry["tx"]
+                        break
+                if captured:
+                    break
+                await asyncio.sleep(1)
+
+        await ctx.close()
+
+    if not captured:
+        log("[red]Tidak ada tx ter-capture dalam 5 menit.[/red]")
+        return None
+
+    log(f"[green]Tx ter-capture![/green] to={captured.get('to')} data_len={len(captured.get('data') or '')}")
+
+    # Build result
+    result = {
+        "contract_address": captured.get("to"),
+        "calldata": captured.get("data"),
+        "value": int(captured.get("value", "0x0"), 16) if isinstance(captured.get("value"), str) and captured.get("value", "").startswith("0x") else int(captured.get("value", 0) or 0),
+        "chain_id": int(captured.get("chainId", "0x2105"), 16) if isinstance(captured.get("chainId"), str) and captured.get("chainId", "").startswith("0x") else BASE_CHAIN_ID,
+        "gas_limit": int(captured.get("gas", "0x493e0"), 16) if isinstance(captured.get("gas"), str) and captured.get("gas", "").startswith("0x") else None,
+        "endpoints": {},
+    }
+
+    # Mine API responses for token address + amount + endpoint names
+    for call in api_calls:
+        url = call["url"]
+        data = call.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        # Token address
+        for k, v in data.items():
+            if isinstance(v, str) and v.startswith("0x") and len(v) == 42:
+                if any(kw in k.lower() for kw in ["token", "asset", "currency"]):
+                    result.setdefault("token_address", v)
+            if isinstance(v, (int, float, str)) and any(kw in k.lower() for kw in ["amount", "allocation", "balance"]):
+                result.setdefault("amount", v)
+        # Endpoint categorization
+        if "claim" in url.lower():
+            result["endpoints"]["claim_auth"] = url.split("?")[0]
+        if "wallet" in url.lower() and "link" in url.lower():
+            result["endpoints"]["link_wallet"] = url.split("?")[0]
+        if "nonce" in url.lower() or "message" in url.lower():
+            result["endpoints"]["link_nonce"] = url.split("?")[0]
+        if "/token" in url.lower():
+            result["endpoints"]["token"] = url.split("?")[0]
+
+    return result
 
 # ---------- Per-wallet flow (pure HTTP) ----------
 def process_wallet(client: OFClient, addr: str, pk: str, dest: str):
@@ -590,12 +861,37 @@ def process_wallet(client: OFClient, addr: str, pk: str, dest: str):
                 claim_data = client.claim_auth(addr)
 
     if not claim_data or not claim_data.get("contract_address") or not claim_data.get("calldata"):
-        log("  [red]Claim data tidak lengkap. Endpoint mungkin perlu discover ulang via Playwright recon.[/red]")
-        log(f"  [dim]Mau coba ulang dengan Playwright auto-discover? [y/N][/dim]")
-        ans = input("  ").strip().lower()
-        if ans == "y":
-            log("  [yellow]TODO: Playwright auto-recon claim button click — coming in next iteration[/yellow]")
-        return
+        log("  [red]Claim data tidak lengkap. Auto-recon via Playwright dibutuhkan.[/red]")
+        log("  [yellow]Browser akan terbuka. Klik tombol Claim di halaman SEKALI.[/yellow]")
+        log("  [yellow]Script akan capture API call & contract address otomatis.[/yellow]")
+        ans = input("  Lanjut auto-recon? [y/N]: ").strip().lower()
+        if ans != "y":
+            log("  [yellow]Skipped.[/yellow]")
+            return
+        recon_result = asyncio.run(playwright_recon_claim(addr))
+        if recon_result:
+            # Save discovered endpoints
+            current_endpoints = load_endpoints()
+            current_endpoints.update(recon_result.get("endpoints", {}))
+            if recon_result.get("contract_address"):
+                current_endpoints["contract_address"] = recon_result["contract_address"]
+            save_endpoints(current_endpoints)
+            # Try again with discovered endpoints
+            claim_data = {
+                "contract_address": recon_result["contract_address"],
+                "calldata": recon_result["calldata"],
+                "chain_id": recon_result.get("chain_id", BASE_CHAIN_ID),
+                "value": recon_result.get("value", 0),
+                "gas_limit": recon_result.get("gas_limit"),
+            }
+            if recon_result.get("token_address"):
+                claim_data["token_address"] = recon_result["token_address"]
+            if recon_result.get("amount"):
+                claim_data["amount"] = recon_result["amount"]
+            log("  [green]Endpoint ter-discover. Lanjut claim via pure HTTP.[/green]")
+        else:
+            log("  [red]Auto-recon gagal. Tidak bisa lanjut.[/red]")
+            return
 
     # 5. Build claim tx
     try:
@@ -615,31 +911,53 @@ def process_wallet(client: OFClient, addr: str, pk: str, dest: str):
         log("  [yellow]Skipped by user.[/yellow]")
         return
 
-    # 7. Broadcast claim
-    log("  [magenta]Broadcasting claim tx...[/magenta]")
+    # 7. PRE-SIGN bundle (claim + sweep) BEFORE broadcast — saves ~10-50ms
+    log("  [dim]Pre-sign claim + sweep bundle...[/dim]")
+    ofc_addr = claim_data.get("token_address") or token_resp.get("token_address")
+    expected_amount = claim_data.get("amount_wei") or claim_data.get("amount")
+    if isinstance(expected_amount, str):
+        try:
+            # could be string of wei or decimal
+            expected_amount = int(expected_amount)
+        except Exception:
+            expected_amount = None
+
+    claim_raw = sign_tx(pk, tx)
+    log(f"  [dim]Bundle ready. Claim raw size: {len(claim_raw)} bytes[/dim]")
+
+    # 8. Broadcast claim — MULTI-RPC parallel
+    t0 = time.time()
+    log("  [magenta]>>> BROADCAST CLAIM (parallel multi-RPC) <<<[/magenta]")
     try:
-        h = send_signed(pk, tx)
+        h, results = broadcast_parallel_sync(claim_raw)
+        broadcast_time = (time.time() - t0) * 1000
+        ok = sum(1 for r in results if r.get("tx_hash"))
+        if not h:
+            log("  [red]Semua RPC tolak tx claim:[/red]")
+            for r in results[:3]:
+                log(f"    {r['rpc']}: {r.get('error', '?')[:100]}")
+            return
+        log(f"  [green]Claim broadcast in {broadcast_time:.0f}ms[/green] ({ok}/{len(results)} RPCs accepted)")
         log(f"  [green]Claim tx:[/green] https://basescan.org/tx/{h}")
     except Exception as e:
         log(f"  [red]Claim broadcast error: {e}[/red]")
         return
 
-    # 8. Wait for OFC to arrive (or just confirmation)
-    ofc_addr = claim_data.get("token_address") or token_resp.get("token_address")
-    log("  [dim]Tunggu tx confirmed + OFC masuk...[/dim]")
+    # 9. Wait for tx confirmation (Base ~2s blocks)
+    log("  [dim]Tunggu claim confirmed...[/dim]")
     try:
-        receipt = w3.eth.wait_for_transaction_receipt(h, timeout=120)
+        receipt = w3.eth.wait_for_transaction_receipt(h, timeout=60, poll_latency=0.5)
         if receipt.status != 1:
             log("  [red]Claim tx reverted![/red]")
             return
-        log("  [green]Claim confirmed.[/green]")
+        log(f"  [green]Claim confirmed in block {receipt.blockNumber}.[/green]")
     except Exception as e:
         log(f"  [yellow]Receipt wait err: {e}[/yellow]")
 
-    # 9. IMMEDIATELY sweep
-    log("  [bold magenta]>>> SWEEP TO CLEAN WALLET <<<[/bold magenta]")
-    sweep_result = execute_sweep(pk, dest, ofc_addr)
-    log(f"  Sweep tx: {sweep_result}")
+    # 10. IMMEDIATELY sweep (multi-RPC parallel, 4x gas)
+    log("  [bold magenta]>>> SWEEP TO CLEAN WALLET (parallel, 4x gas) <<<[/bold magenta]")
+    sweep_result = execute_sweep(pk, dest, ofc_addr, expected_ofc_amount=expected_amount)
+    log(f"  Sweep result: {sweep_result}")
 
 # ---------- Main ----------
 def main():
